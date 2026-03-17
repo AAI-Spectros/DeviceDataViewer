@@ -1,51 +1,44 @@
 """
-Device Data Viewer — Desktop application for querying device data
-from the oncall.collection_datas_archive table with statistics & graphs.
+Device Data Viewer — Desktop application for viewing device data
+from CSV files in the data/ folder with statistics & graphs.
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import datetime, timedelta
+from datetime import datetime
 import csv
+import math
+import os
+import shutil
 import threading
 import statistics
 from collections import defaultdict
-import calendar
-import time
-import mysql.connector
-from tkcalendar import DateEntry
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
-import matplotlib.dates as mdates
-import matplotlib.ticker
 
 
-# ── Database configuration ────────────────────────────────────────────
-DB_CONFIG = {
-    "host": "replace_this",
-    "port": 0000, #replace with your port number
-    "user": "replace_this",
-    "password": "replace_this",
-    "database": "replace_this",
-}
+# ── Data directory ────────────────────────────────────────────────────
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+COLUMNS = ("id", "device_id", "device_time", "server_time", "sat", "hgb", "sensor")
+EXPECTED_COLUMNS = {"Device Time", "Saturation", "tGb", "Sensor", "Marker"}
+DATE_FORMATS = ("%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p")
 
-COLUMNS = ("id", "device_id", "device_time", "server_time", "sat", "hgb", "probe")
+def _try_parse(value: str, fmt: str) -> datetime | None:
+    try:
+        return datetime.strptime(value, fmt)
+    except ValueError:
+        return None
 
-ALLOWED_DEVICES = [
-    "T2-0083",
-    "T2-0084",
-    "T2-0086",
-    "T2-0087",
-    "T2-0186",
-    "T2-0187",
-]
-
+def _discover_csv_files() -> list[str]:
+    """Return sorted list of CSV filenames in DATA_DIR."""
+    if not os.path.isdir(DATA_DIR):
+        return []
+    return sorted(f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv"))
 
 class DeviceDataViewer(tk.Tk):
     """Main application window."""
-
     def __init__(self):
         super().__init__()
         self.title("Device Data Viewer — Statistics")
@@ -54,62 +47,31 @@ class DeviceDataViewer(tk.Tk):
         self.configure(bg="#f0f0f0")
 
         self._rows: list[tuple] = []
-        self._device_list: list[str] = []
+        self._csv_files: list[str] = []
 
         self._build_ui()
         self._load_device_list()
+        self._on_fetch()
 
     # ── UI Construction ───────────────────────────────────────────────
     def _build_ui(self):
-        # Top filter frame
-        filter_frame = ttk.LabelFrame(self, text="Query Filters", padding=10)
-        filter_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+        # Top toolbar
+        toolbar = ttk.Frame(self, padding=10)
+        toolbar.pack(fill=tk.X, padx=10, pady=(10, 5))
 
-        row1 = ttk.Frame(filter_frame)
-        row1.pack(fill=tk.X, pady=(0, 5))
-
-        ttk.Label(row1, text="Device ID:").pack(side=tk.LEFT, padx=(0, 5))
-        self.device_var = tk.StringVar(value="All Devices")
-        self.device_combo = ttk.Combobox(
-            row1, textvariable=self.device_var, width=20, state="readonly"
-        )
-        self.device_combo["values"] = ["All Devices"]
-        self.device_combo.pack(side=tk.LEFT, padx=(0, 15))
-
-        ttk.Label(row1, text="From:").pack(side=tk.LEFT, padx=(0, 5))
-        self.start_date = DateEntry(
-            row1, width=12, date_pattern="yyyy-mm-dd",
-            year=datetime.now().year, month=datetime.now().month, day=1,
-        )
-        self.start_date.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.start_hour = ttk.Spinbox(row1, from_=0, to=23, width=3, format="%02.0f")
-        self.start_hour.set("00")
-        self.start_hour.pack(side=tk.LEFT)
-        ttk.Label(row1, text=":").pack(side=tk.LEFT)
-        self.start_min = ttk.Spinbox(row1, from_=0, to=59, width=3, format="%02.0f")
-        self.start_min.set("00")
-        self.start_min.pack(side=tk.LEFT, padx=(0, 15))
-
-        ttk.Label(row1, text="To:").pack(side=tk.LEFT, padx=(0, 5))
-        self.end_date = DateEntry(row1, width=12, date_pattern="yyyy-mm-dd")
-        self.end_date.pack(side=tk.LEFT, padx=(0, 5))
-
-        self.end_hour = ttk.Spinbox(row1, from_=0, to=23, width=3, format="%02.0f")
-        self.end_hour.set("23")
-        self.end_hour.pack(side=tk.LEFT)
-        ttk.Label(row1, text=":").pack(side=tk.LEFT)
-        self.end_min = ttk.Spinbox(row1, from_=0, to=59, width=3, format="%02.0f")
-        self.end_min.set("59")
-        self.end_min.pack(side=tk.LEFT, padx=(0, 15))
-
-        self.fetch_btn = ttk.Button(row1, text="Fetch Data", command=self._on_fetch)
-        self.fetch_btn.pack(side=tk.LEFT, padx=(10, 5))
+        self.fetch_btn = ttk.Button(toolbar, text="Load Data", command=self._on_fetch)
+        self.fetch_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         self.export_btn = ttk.Button(
-            row1, text="Export CSV", command=self._export_csv, state=tk.DISABLED
+            toolbar, text="Export CSV", command=self._export_csv, state=tk.DISABLED
         )
         self.export_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.upload_btn = ttk.Button(toolbar, text="Upload File", command=self._upload_file)
+        self.upload_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.remove_btn = ttk.Button(toolbar, text="Remove File", command=self._remove_file)
+        self.remove_btn.pack(side=tk.LEFT, padx=(0, 5))
 
         # Status bar
         status_frame = ttk.Frame(self)
@@ -128,15 +90,9 @@ class DeviceDataViewer(tk.Tk):
         self.notebook.add(self.stats_frame, text="  Summary Statistics  ")
         self._build_stats_tab()
 
-        # Tab 2 — Time-series charts
-        self.charts_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.charts_frame, text="  Time Series  ")
-
-        # Tab 3 — Distribution histograms
+        # Tab 2 — Distribution histograms
         self.hist_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.hist_frame, text="  Distributions  ")
-
-
 
     def _build_stats_tab(self):
         # Overall stats table
@@ -166,124 +122,65 @@ class DeviceDataViewer(tk.Tk):
 
     # ── Load device list ────────────────────────────────────────────────
     def _load_device_list(self):
-        self._device_list = ALLOWED_DEVICES
-        self.device_combo["values"] = ["All Devices"] + ALLOWED_DEVICES
-        self.status_var.set(f"Ready — {len(ALLOWED_DEVICES)} devices available")
+        self._csv_files = _discover_csv_files()
+        self.status_var.set(f"Ready — {len(self._csv_files)} file(s) available")
 
     # ── Fetch data ────────────────────────────────────────────────────
     def _on_fetch(self):
-        try:
-            start_dt = datetime.combine(
-                self.start_date.get_date(),
-                datetime.strptime(
-                    f"{int(self.start_hour.get()):02d}:{int(self.start_min.get()):02d}:00",
-                    "%H:%M:%S",
-                ).time(),
-            )
-            end_dt = datetime.combine(
-                self.end_date.get_date(),
-                datetime.strptime(
-                    f"{int(self.end_hour.get()):02d}:{int(self.end_min.get()):02d}:59",
-                    "%H:%M:%S",
-                ).time(),
-            )
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter valid date/time values.")
-            return
-
-        if start_dt > end_dt:
-            messagebox.showerror("Invalid Range", "Start date/time must be before end date/time.")
-            return
-
-        device = self.device_var.get()
-        device_filter = None if device == "All Devices" else device
-
         self.fetch_btn.config(state=tk.DISABLED)
         self.export_btn.config(state=tk.DISABLED)
         self.progress["value"] = 0
-        self.status_var.set("Querying database…")
+        self.status_var.set("Loading CSV files…")
 
         threading.Thread(
             target=self._fetch_worker,
-            args=(start_dt, end_dt, device_filter),
             daemon=True,
         ).start()
 
-    @staticmethod
-    def _week_chunks(start_dt: datetime, end_dt: datetime):
-        """Yield (chunk_start, chunk_end) pairs, one per 7-day window."""
-        cur = start_dt
-        while cur <= end_dt:
-            chunk_end = min(cur + timedelta(days=6, hours=23, minutes=59, seconds=59) - timedelta(
-                hours=cur.hour, minutes=cur.minute, seconds=cur.second),
-                end_dt)
-            # simpler: advance 6 days then cap at end-of-day
-            day_end = (cur + timedelta(days=6)).replace(hour=23, minute=59, second=59)
-            chunk_end = min(day_end, end_dt)
-            yield cur, chunk_end
-            cur = chunk_end + timedelta(seconds=1)
-
-    def _fetch_worker(self, start_dt: datetime, end_dt: datetime, device_id: str | None):
-
-        chunks = list(self._week_chunks(start_dt, end_dt))
-        # Query one device at a time — smaller result sets, uses index better
-        devices = [device_id] if device_id else ALLOWED_DEVICES
-        tasks = [(c_start, c_end, dev) for (c_start, c_end) in chunks for dev in devices]
-        total_tasks = len(tasks)
+    def _fetch_worker(self):
+        files = self._csv_files
         all_rows: list[tuple] = []
+        total = len(files)
 
-        for idx, (c_start, c_end, dev) in enumerate(tasks, 1):
-            label = f"{dev} {c_start.strftime('%b %d')}–{c_end.strftime('%b %d')}"
-            self.after(0, lambda i=idx, t=total_tasks, lb=label, n=len(all_rows):
+        for idx, fname in enumerate(files, 1):
+            # Derive a label from the filename (strip extension)
+            label = os.path.splitext(fname)[0]
+            self.after(0, lambda lb=label, i=idx, t=total, n=len(all_rows):
                        self.status_var.set(
-                           f"Fetching {lb}  ({i}/{t}) — {n:,} rows so far"))
+                           f"Loading {lb}… ({i}/{t}) — {n:,} rows so far"))
 
-            query = (
-                "SELECT id, device_id, device_time, server_time, sat, hgb, probe "
-                "FROM collection_datas_archive "
-                "WHERE device_id = %s AND device_time BETWEEN %s AND %s "
-                "ORDER BY device_time"
-            )
-            params = [dev, c_start, c_end]
+            csv_path = os.path.join(DATA_DIR, fname)
 
-            success = False
-            for attempt in range(3):
-                try:
-                    conn = mysql.connector.connect(
-                        **DB_CONFIG, connection_timeout=30, read_timeout=600,
-                    )
-                    cursor = conn.cursor()
-                    cursor.execute(query, params)
-                    rows = cursor.fetchall()
-                    cursor.close()
-                    conn.close()
-                    all_rows.extend(rows)
-                    success = True
-                    break
-                except mysql.connector.Error:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    if attempt < 2:
-                        self.after(0, lambda lb=label, a=attempt:
-                                   self.status_var.set(
-                                       f"Retrying {lb} ({a + 1}/2)…"))
-                        time.sleep(3 * (attempt + 1))
-
-            if not success:
-                self.after(0, lambda lb=label:
-                           self._query_error(f"Failed after 3 attempts on {lb}"))
+            try:
+                with open(csv_path, "r", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        raw = row.get("Device Time", "").strip()
+                        if not raw:
+                            continue
+                        dt = None
+                        for fmt in DATE_FORMATS:
+                            dt = _try_parse(raw, fmt)
+                            if dt:
+                                break
+                        if dt is None:
+                            continue
+                        sat = float(row.get("Saturation", 0))
+                        hgb = float(row.get("tGb", 0))
+                        sensor = row.get("Sensor", "")
+                        all_rows.append((0, label, dt, dt, sat, hgb, sensor))
+            except OSError as exc:
+                self.after(0, lambda lb=label, e=str(exc):
+                           self._query_error(f"Error reading {lb}: {e}"))
                 return
 
-            pct = int(idx / total_tasks * 100)
+            pct = int(idx / total * 100)
             self.after(0, lambda p=pct: self.progress.configure(value=p))
 
-            if idx < total_tasks:
-                time.sleep(0.5)
-
-        # Sort by device_time across all devices
+        # Sort by device_time across all devices, then assign sequential IDs
         all_rows.sort(key=lambda r: r[2])
+        all_rows = [(i + 1, r[1], r[2], r[3], r[4], r[5], r[6])
+                     for i, r in enumerate(all_rows)]
         self.after(0, lambda: self._display_results(all_rows))
 
     # ── Display results ───────────────────────────────────────────────
@@ -303,27 +200,20 @@ class DeviceDataViewer(tk.Tk):
 
         # Parse columns
         device_ids = [r[1] for r in rows]
-        times = [
-            r[2] if isinstance(r[2], datetime)
-            else datetime.strptime(str(r[2]), "%Y-%m-%d %H:%M:%S")
-            for r in rows
-        ]
         sats = [float(r[4]) for r in rows]
         hgbs = [float(r[5]) for r in rows]
-        probes = [float(r[6]) for r in rows]
 
-        self._update_summary_stats(device_ids, sats, hgbs, probes)
-        self._update_timeseries(times, sats, hgbs)
-        self._update_histograms(sats, hgbs, probes)
+        self._update_summary_stats(device_ids, sats, hgbs)
+        self._update_histograms(device_ids, sats, hgbs)
 
     def _query_error(self, msg: str):
         self.progress["value"] = 0
         self.fetch_btn.config(state=tk.NORMAL)
-        self.status_var.set("Query failed")
-        messagebox.showerror("Database Error", msg)
+        self.status_var.set("Load failed")
+        messagebox.showerror("Data Error", msg)
 
     # ── Tab 1: Summary Statistics ─────────────────────────────────────
-    def _update_summary_stats(self, device_ids, sats, hgbs, probes):
+    def _update_summary_stats(self, device_ids, sats, hgbs):
         for item in self.stats_tree.get_children():
             self.stats_tree.delete(item)
         for item in self.dev_stats_tree.get_children():
@@ -343,11 +233,10 @@ class DeviceDataViewer(tk.Tk):
             self.stats_tree.insert("", tk.END, values=r)
 
         # Per-device breakdown
-        buckets = defaultdict(lambda: {"sat": [], "hgb": [], "probe": []})
-        for did, s, h, p in zip(device_ids, sats, hgbs, probes):
+        buckets = defaultdict(lambda: {"sat": [], "hgb": []})
+        for did, s, h in zip(device_ids, sats, hgbs):
             buckets[did]["sat"].append(s)
             buckets[did]["hgb"].append(h)
-            buckets[did]["probe"].append(p)
 
         for did in sorted(buckets):
             b = buckets[did]
@@ -358,112 +247,188 @@ class DeviceDataViewer(tk.Tk):
                 _f(statistics.mean(b["hgb"])),
             ))
 
-    # ── Tab 2: Time-series charts ─────────────────────────────────────
-    def _update_timeseries(self, times, sats, hgbs):
-        for w in self.charts_frame.winfo_children():
-            w.destroy()
-
-        # Normalize SAT: divide by 100 to get 0–1 range (like OncallDataForm)
-        sats_norm = [s / 100.0 for s in sats]
-
-        # Thin out if too many points (pick every Nth point, no averaging)
-        n = len(times)
-        max_pts = 5000
-        if n > max_pts:
-            step = n // max_pts
-            indices = range(0, n, step)
-            times_p = [times[i] for i in indices]
-            sats_p = [sats_norm[i] for i in indices]
-            hgbs_p = [hgbs[i] for i in indices]
-        else:
-            times_p, sats_p, hgbs_p = times, sats_norm, hgbs
-
-        # Use sequential index for X-axis (like C# IsXValueIndexed = true)
-        # This eliminates gaps and makes lines clean
-        x_indices = list(range(len(times_p)))
-
-        # Build tick labels at regular intervals
-        num_ticks = min(40, len(times_p))
-        tick_step = max(1, len(times_p) // num_ticks)
-        tick_positions = list(range(0, len(times_p), tick_step))
-        tick_labels = [times_p[i].strftime("%m/%d %H:%M") for i in tick_positions]
-
-        fig = Figure(figsize=(11, 5), dpi=96)
-        fig.subplots_adjust(left=0.08, right=0.92, top=0.92, bottom=0.22)
-
-        ax1 = fig.add_subplot(1, 1, 1)
-
-        # SAT on primary Y-axis (blue)
-        ax1.plot(x_indices, sats_p, linewidth=1, color="blue", label="Sat")
-        ax1.set_ylabel("Saturation", fontsize=11)
-        ax1.set_ylim(0, 1)
-        ax1.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(xmax=1.0))
-        ax1.set_yticks([0, 0.25, 0.50, 0.75, 1.00])
-        ax1.grid(True, alpha=0.3)
-
-        # HGB (tGb) on secondary Y-axis (orange/yellow)
-        ax2 = ax1.twinx()
-        ax2.plot(x_indices, hgbs_p, linewidth=1, color="#FFC800", label="tGb")
-        ax2.set_ylabel("Total Relative Hemoglobin", fontsize=11)
-        ax2.set_ylim(0, 0.5)
-        ax2.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5])
-        ax2.yaxis.grid(False)
-
-        # X-axis labels
-        ax1.set_xticks(tick_positions)
-        ax1.set_xticklabels(tick_labels, rotation=90, fontsize=7)
-        ax1.set_xlabel("Device Date and Time", fontsize=11)
-        ax1.set_xlim(0, len(times_p) - 1)
-
-        # Title
-        device = self.device_var.get()
-        if device != "All Devices":
-            fig.suptitle(f"Data for {device}", fontsize=14, fontweight="bold")
-        else:
-            fig.suptitle("Time Series — All Devices", fontsize=14, fontweight="bold")
-
-        # Combined legend
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
-
-        canvas = FigureCanvasTkAgg(fig, master=self.charts_frame)
-        canvas.draw()
-        toolbar = NavigationToolbar2Tk(canvas, self.charts_frame)
-        toolbar.update()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    # ── Tab 3: Distribution histograms ────────────────────────────────
-    def _update_histograms(self, sats, hgbs, probes):
+    # ── Tab 2: Distribution histograms ────────────────────────────────
+    def _update_histograms(self, device_ids, sats, hgbs):
         for w in self.hist_frame.winfo_children():
             w.destroy()
 
-        fig = Figure(figsize=(11, 5), dpi=96)
-        fig.subplots_adjust(wspace=0.35, left=0.06, right=0.97, top=0.92, bottom=0.12)
+        # Group data by device
+        buckets = defaultdict(lambda: {"sat": [], "hgb": []})
+        for did, s, h in zip(device_ids, sats, hgbs):
+            buckets[did]["sat"].append(s)
+            buckets[did]["hgb"].append(h)
 
-        for i, (label, data, color) in enumerate([
-            ("SAT", sats, "#1f77b4"),
-            ("HGB", hgbs, "#ff7f0e"),
-        ], 1):
-            ax = fig.add_subplot(1, 2, i)
-            bins = min(50, max(10, len(set(data)) // 2 or 10))
-            ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85)
-            ax.set_title(f"{label} Distribution")
-            ax.set_xlabel(label)
-            ax.set_ylabel("Frequency")
-            ax.grid(True, alpha=0.3, axis="y")
+        devices = sorted(buckets)
+        n_devices = len(devices)
+        if not n_devices:
+            return
 
-            m = statistics.mean(data)
-            med = statistics.median(data)
-            ax.axvline(m, color="red", linestyle="--", linewidth=1, label=f"Mean: {m:.2f}")
-            ax.axvline(med, color="black", linestyle=":", linewidth=1, label=f"Median: {med:.2f}")
-            ax.legend(fontsize=7)
+        fig = Figure(figsize=(11, 3.5 * n_devices), dpi=96)
+        fig.subplots_adjust(wspace=0.35, hspace=0.45,
+                            left=0.06, right=0.97, top=0.96, bottom=0.04)
 
-        canvas = FigureCanvasTkAgg(fig, master=self.hist_frame)
-        canvas.draw()
-        toolbar = NavigationToolbar2Tk(canvas, self.hist_frame)
+        for row_idx, dev in enumerate(devices):
+            b = buckets[dev]
+            for col_idx, (label, data, color) in enumerate([
+                ("SAT", b["sat"], "#1f77b4"),
+                ("HGB", b["hgb"], "#ff7f0e"),
+            ]):
+                ax = fig.add_subplot(n_devices, 2, row_idx * 2 + col_idx + 1)
+                n = len(data)
+
+                # Sturges' rule for bin count: ceil(log2(n) + 1)
+                bins = max(1, int(math.ceil(math.log2(n) + 1))) if n > 1 else 1
+
+                ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85,
+                        density=False)
+                ax.set_title(f"{dev} — {label} Distribution (N={n:,})", fontsize=9)
+                ax.set_xlabel(label, fontsize=8)
+                ax.set_ylabel("Frequency", fontsize=8)
+                ax.tick_params(labelsize=7)
+                ax.grid(True, alpha=0.3, axis="y")
+
+                m = statistics.mean(data)
+                med = statistics.median(data)
+                sd = statistics.stdev(data) if n > 1 else 0.0
+                ax.axvline(m, color="red", linestyle="--", linewidth=1,
+                           label=f"Mean: {m:.4f}")
+                ax.axvline(med, color="black", linestyle=":", linewidth=1,
+                           label=f"Median: {med:.4f}")
+                # Show ±1 SD band
+                if sd > 0:
+                    ax.axvspan(m - sd, m + sd, alpha=0.1, color="red",
+                               label=f"±1 SD: {sd:.4f}")
+                ax.legend(fontsize=6)
+
+        # Scrollable canvas to handle many devices
+        canvas_widget = tk.Canvas(self.hist_frame)
+        scrollbar = ttk.Scrollbar(self.hist_frame, orient=tk.VERTICAL,
+                                  command=canvas_widget.yview)
+        canvas_widget.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(canvas_widget)
+        canvas_widget.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        chart = FigureCanvasTkAgg(fig, master=inner)
+        chart.draw()
+        chart.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(chart, inner)
         toolbar.update()
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        inner.update_idletasks()
+        canvas_widget.configure(scrollregion=canvas_widget.bbox("all"))
+        canvas_widget.bind("<MouseWheel>",
+                           lambda e: canvas_widget.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    # ── Upload File ────────────────────────────────────────────────────
+    def _upload_file(self):
+        paths = filedialog.askopenfilenames(
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Select CSV file(s) to upload",
+        )
+        if not paths:
+            return
+
+        os.makedirs(DATA_DIR, exist_ok=True)
+        added = 0
+        for src in paths:
+            fname = os.path.basename(src)
+            error = self._validate_csv(src)
+            if error:
+                messagebox.showwarning(
+                    "Invalid File",
+                    f"Data for \"{fname}\" can't be loaded due to incorrect format.\n\n{error}",
+                )
+                continue
+            dest = os.path.join(DATA_DIR, fname)
+            shutil.copy2(src, dest)
+            added += 1
+
+        if added:
+            self._load_device_list()
+            self._on_fetch()
+            self.status_var.set(f"Uploaded {added} file(s) — data reloaded")
+
+    # ── Remove File ───────────────────────────────────────────────────
+    def _remove_file(self):
+        files = self._csv_files
+        if not files:
+            messagebox.showinfo("No Files", "There are no files in the data folder to remove.")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Remove File")
+        dialog.geometry("400x350")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Select file(s) to remove:").pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        listbox = tk.Listbox(dialog, selectmode=tk.EXTENDED)
+        for f in files:
+            listbox.insert(tk.END, f)
+        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        def do_remove():
+            selected = [listbox.get(i) for i in listbox.curselection()]
+            if not selected:
+                return
+            confirm = messagebox.askyesno(
+                "Confirm Removal",
+                f"Remove {len(selected)} file(s) from the data folder?\n\n"
+                + "\n".join(selected),
+                parent=dialog,
+            )
+            if not confirm:
+                return
+            for fname in selected:
+                try:
+                    os.remove(os.path.join(DATA_DIR, fname))
+                except OSError:
+                    pass
+            dialog.destroy()
+            self._load_device_list()
+            self._on_fetch()
+            self.status_var.set(f"Removed {len(selected)} file(s) — data reloaded")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="Remove Selected", command=do_remove).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+
+    @staticmethod
+    def _validate_csv(path: str) -> str | None:
+        """Return an error message if the CSV doesn't match expected format, else None."""
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None:
+                    return "File is empty or has no header row."
+                headers = {h.strip() for h in reader.fieldnames}
+                missing = EXPECTED_COLUMNS - headers
+                if missing:
+                    return f"Missing required columns: {', '.join(sorted(missing))}"
+
+                # Check that at least the first data row can be parsed
+                first = next(reader, None)
+                if first is None:
+                    return "File has a header but no data rows."
+                raw_dt = first.get("Device Time", "").strip()
+                if not any(_try_parse(raw_dt, fmt) for fmt in DATE_FORMATS):
+                    return f"Cannot parse 'Device Time' value: \"{raw_dt}\""
+                try:
+                    float(first.get("Saturation", ""))
+                except (ValueError, TypeError):
+                    return f"Cannot parse 'Saturation' as a number."
+                try:
+                    float(first.get("tGb", ""))
+                except (ValueError, TypeError):
+                    return f"Cannot parse 'tGb' as a number."
+        except OSError as exc:
+            return f"Cannot read file: {exc}"
+        return None
 
     # ── CSV Export ────────────────────────────────────────────────────
     def _export_csv(self):
@@ -482,7 +447,6 @@ class DeviceDataViewer(tk.Tk):
             self.status_var.set(f"Exported {len(self._rows):,} rows to {path}")
         except OSError as exc:
             messagebox.showerror("Export Error", str(exc))
-
 
 if __name__ == "__main__":
     app = DeviceDataViewer()
