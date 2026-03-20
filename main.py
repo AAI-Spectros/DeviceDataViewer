@@ -13,15 +13,17 @@ import shutil
 import threading
 import statistics
 from collections import defaultdict
+from datetime import timedelta
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+import matplotlib.dates as mdates
 
 
 # ── Data directory ────────────────────────────────────────────────────
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-COLUMNS = ("id", "device_id", "device_time", "server_time", "sat", "hgb", "sensor")
+COLUMNS = ("id", "device_id", "device_time", "server_time", "sat", "hgb", "sensor", "marker")
 EXPECTED_COLUMNS = {"Device Time", "Saturation", "tGb", "Sensor", "Marker"}
 DATE_FORMATS = ("%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p")
 
@@ -94,6 +96,10 @@ class DeviceDataViewer(tk.Tk):
         self.hist_frame = ttk.Frame(self.notebook)
         self.notebook.add(self.hist_frame, text="  Distributions  ")
 
+        # Tab 3 — Time Series Charts
+        self.ts_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.ts_frame, text="  Time Series  ")
+
     def _build_stats_tab(self):
         # Overall stats table
         cols = ("Metric", "SAT", "HGB")
@@ -107,7 +113,7 @@ class DeviceDataViewer(tk.Tk):
         ttk.Label(self.stats_frame, text="Per-Device Breakdown",
                   font=("Segoe UI", 10, "bold")).pack(anchor=tk.W, padx=10)
 
-        dev_cols = ("Device", "Records", "SAT Mean", "HGB Mean")
+        dev_cols = ("Device", "SAT Mean", "HGB Mean")
         dev_container = ttk.Frame(self.stats_frame)
         dev_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
@@ -168,7 +174,8 @@ class DeviceDataViewer(tk.Tk):
                         sat = float(row.get("Saturation", 0))
                         hgb = float(row.get("tGb", 0))
                         sensor = row.get("Sensor", "")
-                        all_rows.append((0, label, dt, dt, sat, hgb, sensor))
+                        marker = row.get("Marker", "").strip()
+                        all_rows.append((0, label, dt, dt, sat, hgb, sensor, marker))
             except OSError as exc:
                 self.after(0, lambda lb=label, e=str(exc):
                            self._query_error(f"Error reading {lb}: {e}"))
@@ -179,7 +186,7 @@ class DeviceDataViewer(tk.Tk):
 
         # Sort by device_time across all devices, then assign sequential IDs
         all_rows.sort(key=lambda r: r[2])
-        all_rows = [(i + 1, r[1], r[2], r[3], r[4], r[5], r[6])
+        all_rows = [(i + 1, r[1], r[2], r[3], r[4], r[5], r[6], r[7])
                      for i, r in enumerate(all_rows)]
         self.after(0, lambda: self._display_results(all_rows))
 
@@ -204,7 +211,8 @@ class DeviceDataViewer(tk.Tk):
         hgbs = [float(r[5]) for r in rows]
 
         self._update_summary_stats(device_ids, sats, hgbs)
-        self._update_histograms(device_ids, sats, hgbs)
+        self._update_histograms(rows)
+        self._update_time_series(rows)
 
     def _query_error(self, msg: str):
         self.progress["value"] = 0
@@ -223,7 +231,6 @@ class DeviceDataViewer(tk.Tk):
             return f"{v:.4f}"
 
         rows = [
-            ("Count", str(len(sats)), str(len(hgbs))),
             ("Mean", _f(statistics.mean(sats)), _f(statistics.mean(hgbs))),
             ("Min", _f(min(sats)), _f(min(hgbs))),
             ("Max", _f(max(sats)), _f(max(hgbs))),
@@ -240,67 +247,63 @@ class DeviceDataViewer(tk.Tk):
 
         for did in sorted(buckets):
             b = buckets[did]
-            n = len(b["sat"])
             self.dev_stats_tree.insert("", tk.END, values=(
-                did, n,
+                did,
                 _f(statistics.mean(b["sat"])),
                 _f(statistics.mean(b["hgb"])),
             ))
 
     # ── Tab 2: Distribution histograms ────────────────────────────────
-    def _update_histograms(self, device_ids, sats, hgbs):
+    def _update_histograms(self, rows: list[tuple]):
         for w in self.hist_frame.winfo_children():
             w.destroy()
 
-        # Group data by device
-        buckets = defaultdict(lambda: {"sat": [], "hgb": []})
-        for did, s, h in zip(device_ids, sats, hgbs):
-            buckets[did]["sat"].append(s)
-            buckets[did]["hgb"].append(h)
+        # Group rows by device, then split by "New Sensor!" into first/after 12h
+        device_rows: dict[str, list[tuple]] = defaultdict(list)
+        for r in rows:
+            device_rows[r[1]].append(r)
 
-        devices = sorted(buckets)
-        n_devices = len(devices)
-        if not n_devices:
+        # Collect SAT per sensor segment: first-12h and after-12h
+        all_hist_segments: list[tuple[str, list[float], list[float]]] = []
+        all_sat_first: list[float] = []
+        all_sat_after: list[float] = []
+
+        for dev in sorted(device_rows):
+            dev_data = sorted(device_rows[dev], key=lambda r: r[2])
+            segments: list[list[tuple]] = []
+            current_segment: list[tuple] = []
+            for r in dev_data:
+                if r[7] == "New Sensor!":
+                    if current_segment:
+                        segments.append(current_segment)
+                    current_segment = [r]
+                else:
+                    current_segment.append(r)
+            if current_segment:
+                segments.append(current_segment)
+
+            for seg_idx, seg in enumerate(segments, 1):
+                if not seg:
+                    continue
+                first_time = seg[0][2]
+                cutoff = first_time + timedelta(hours=12)
+                title = f"{dev} — Patient {seg_idx}"
+                sat_first: list[float] = []
+                sat_after: list[float] = []
+                for r in seg:
+                    s = float(r[4]) * 100  # SAT as %
+                    if r[2] < cutoff:
+                        sat_first.append(s)
+                    else:
+                        sat_after.append(s)
+                all_sat_first.extend(sat_first)
+                all_sat_after.extend(sat_after)
+                all_hist_segments.append((title, sat_first, sat_after))
+
+        if not all_hist_segments:
             return
 
-        fig = Figure(figsize=(11, 3.5 * n_devices), dpi=96)
-        fig.subplots_adjust(wspace=0.35, hspace=0.45,
-                            left=0.06, right=0.97, top=0.96, bottom=0.04)
-
-        for row_idx, dev in enumerate(devices):
-            b = buckets[dev]
-            for col_idx, (label, data, color) in enumerate([
-                ("SAT", b["sat"], "#1f77b4"),
-                ("HGB", b["hgb"], "#ff7f0e"),
-            ]):
-                ax = fig.add_subplot(n_devices, 2, row_idx * 2 + col_idx + 1)
-                n = len(data)
-
-                # Sturges' rule for bin count: ceil(log2(n) + 1)
-                bins = max(1, int(math.ceil(math.log2(n) + 1))) if n > 1 else 1
-
-                ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85,
-                        density=False)
-                ax.set_title(f"{dev} — {label} Distribution (N={n:,})", fontsize=9)
-                ax.set_xlabel(label, fontsize=8)
-                ax.set_ylabel("Frequency", fontsize=8)
-                ax.tick_params(labelsize=7)
-                ax.grid(True, alpha=0.3, axis="y")
-
-                m = statistics.mean(data)
-                med = statistics.median(data)
-                sd = statistics.stdev(data) if n > 1 else 0.0
-                ax.axvline(m, color="red", linestyle="--", linewidth=1,
-                           label=f"Mean: {m:.4f}")
-                ax.axvline(med, color="black", linestyle=":", linewidth=1,
-                           label=f"Median: {med:.4f}")
-                # Show ±1 SD band
-                if sd > 0:
-                    ax.axvspan(m - sd, m + sd, alpha=0.1, color="red",
-                               label=f"±1 SD: {sd:.4f}")
-                ax.legend(fontsize=6)
-
-        # Scrollable canvas to handle many devices
+        # ── Build scrollable container ──
         canvas_widget = tk.Canvas(self.hist_frame)
         scrollbar = ttk.Scrollbar(self.hist_frame, orient=tk.VERTICAL,
                                   command=canvas_widget.yview)
@@ -310,6 +313,233 @@ class DeviceDataViewer(tk.Tk):
 
         inner = ttk.Frame(canvas_widget)
         canvas_widget.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        fig_w = max(11, self.winfo_width() / 96)
+
+        # ═══ Section 1: All devices combined ═══
+        ttk.Label(inner, text="All Devices Distribution Charts",
+                  font=("Segoe UI", 14, "bold"), anchor=tk.CENTER).pack(
+                  fill=tk.X, pady=(15, 10))
+
+        fig_all = Figure(figsize=(fig_w, 4), dpi=96)
+        fig_all.subplots_adjust(wspace=0.30, left=0.05, right=0.97,
+                                top=0.88, bottom=0.12)
+        bins = [i * 5 for i in range(17)]
+
+        for col_idx, (period, data, color) in enumerate([
+            ("First 12h", all_sat_first, "#1f77b4"),
+            ("After 12h", all_sat_after, "#2ca02c"),
+        ]):
+            ax = fig_all.add_subplot(1, 2, col_idx + 1)
+            n = len(data)
+            ax.set_xlim(0, 80)
+            ax.set_xticks(range(0, 81, 10))
+
+            if n == 0:
+                ax.set_title(f"All Devices — {period} (N=0)", fontsize=10)
+                ax.set_facecolor("#f5f5f5")
+                ax.text(0.5, 0.5, "NO DATA", ha="center", va="center",
+                        fontsize=28, color="#cccccc", fontweight="bold",
+                        rotation=30, transform=ax.transAxes)
+                ax.tick_params(labelsize=7)
+                ax.grid(True, alpha=0.3, axis="y")
+                continue
+
+            ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85)
+            ax.set_title(f"All Devices — {period} (N={n:,})", fontsize=10)
+            ax.set_xlabel("SAT (%)", fontsize=8)
+            ax.set_ylabel("Frequency", fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, alpha=0.3, axis="y")
+
+            m = statistics.mean(data)
+            ax.axvline(m, color="red", linestyle="--", linewidth=1,
+                       label=f"Mean: {m:.2f}")
+            ax.legend(fontsize=6)
+
+        chart_all = FigureCanvasTkAgg(fig_all, master=inner)
+        chart_all.draw()
+        chart_all.get_tk_widget().pack(fill=tk.X, pady=(0, 5))
+
+        # ═══ Divider ═══
+        ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10, padx=10)
+
+        # ═══ Section 2: Per device charts ═══
+        ttk.Label(inner, text="Per Device Distribution Charts",
+                  font=("Segoe UI", 14, "bold"), anchor=tk.CENTER).pack(
+                  fill=tk.X, pady=(5, 10))
+
+        n_segments = len(all_hist_segments)
+        fig_dev = Figure(figsize=(fig_w, 3.5 * n_segments), dpi=96)
+        fig_dev.subplots_adjust(wspace=0.30, hspace=0.55,
+                                left=0.05, right=0.97, top=0.97, bottom=0.03)
+
+        for row_idx, (title, sat_first, sat_after) in enumerate(all_hist_segments):
+            for col_idx, (period, data, color) in enumerate([
+                ("First 12h", sat_first, "#1f77b4"),
+                ("After 12h", sat_after, "#2ca02c"),
+            ]):
+                ax = fig_dev.add_subplot(n_segments, 2, row_idx * 2 + col_idx + 1)
+                n = len(data)
+                ax.set_xlim(0, 80)
+                ax.set_xticks(range(0, 81, 10))
+
+                if n == 0:
+                    ax.set_title(f"{title} — {period} (N=0)", fontsize=8)
+                    ax.set_facecolor("#f5f5f5")
+                    ax.text(0.5, 0.5, "NO DATA", ha="center", va="center",
+                            fontsize=28, color="#cccccc", fontweight="bold",
+                            rotation=30, transform=ax.transAxes)
+                    ax.tick_params(labelsize=6)
+                    ax.grid(True, alpha=0.3, axis="y")
+                    continue
+
+                ax.hist(data, bins=bins, color=color, edgecolor="white", alpha=0.85)
+                ax.set_title(f"{title} — {period} (N={n:,})", fontsize=8)
+                ax.set_xlabel("SAT (%)", fontsize=7)
+                ax.set_ylabel("Frequency", fontsize=7)
+                ax.tick_params(labelsize=6)
+                ax.grid(True, alpha=0.3, axis="y")
+
+                m = statistics.mean(data)
+                ax.axvline(m, color="red", linestyle="--", linewidth=1,
+                           label=f"Mean: {m:.4f}")
+                ax.legend(fontsize=5)
+
+        chart_dev = FigureCanvasTkAgg(fig_dev, master=inner)
+        chart_dev.draw()
+        chart_dev.get_tk_widget().pack(fill=tk.X, pady=(0, 5))
+        toolbar_dev = NavigationToolbar2Tk(chart_dev, inner)
+        toolbar_dev.update()
+
+        inner.update_idletasks()
+        canvas_widget.configure(scrollregion=canvas_widget.bbox("all"))
+        canvas_widget.bind("<MouseWheel>",
+                           lambda e: canvas_widget.yview_scroll(-1 * (e.delta // 120), "units"))
+
+    # ── Tab 3: Time Series Charts ─────────────────────────────────────
+    def _update_time_series(self, rows: list[tuple]):
+        for w in self.ts_frame.winfo_children():
+            w.destroy()
+
+        # Group rows by device (label), preserving order
+        device_rows: dict[str, list[tuple]] = defaultdict(list)
+        for r in rows:
+            device_rows[r[1]].append(r)
+
+        # For each device, split into segments by "New Sensor!" marker
+        all_segments: list[tuple[str, list[tuple]]] = []  # (title, filtered_rows)
+
+        for dev in sorted(device_rows):
+            dev_data = device_rows[dev]
+            # Sort by time within device
+            dev_data.sort(key=lambda r: r[2])
+
+            segments: list[list[tuple]] = []
+            current_segment: list[tuple] = []
+            for r in dev_data:
+                marker = r[7]
+                if marker == "New Sensor!":
+                    if current_segment:
+                        segments.append(current_segment)
+                    current_segment = [r]
+                else:
+                    current_segment.append(r)
+            if current_segment:
+                segments.append(current_segment)
+
+            for seg_idx, seg in enumerate(segments, 1):
+                if not seg:
+                    continue
+                first_time = seg[0][2]
+                cutoff = first_time + timedelta(hours=12)
+                filtered = [r for r in seg if r[2] >= cutoff]
+                if filtered:
+                    title = f"{dev} — Patient {seg_idx}"
+                    all_segments.append((title, filtered))
+
+        n_segments = len(all_segments)
+        if not n_segments:
+            ttk.Label(self.ts_frame, text="No data available within 12-hour window.",
+                      font=("Segoe UI", 10)).pack(pady=20)
+            return
+
+        # Store segments so we can re-layout on resize
+        self._ts_segments = all_segments
+        self._ts_current_cols = 0  # force initial draw
+        self._ts_resize_id = None
+        self._ts_draw_charts()
+
+        # Bind resize only to the main window, only redraw when column count changes
+        self.bind("<Configure>", self._on_ts_resize)
+
+    def _on_ts_resize(self, event):
+        # Only react to the main window's own configure events
+        if event.widget is not self:
+            return
+        if not hasattr(self, "_ts_segments") or not self._ts_segments:
+            return
+        if self._ts_resize_id:
+            self.after_cancel(self._ts_resize_id)
+        self._ts_resize_id = self.after(400, self._ts_check_relayout)
+
+    def _ts_check_relayout(self):
+        """Only redraw if the number of columns actually changed."""
+        win_width = self.winfo_width()
+        new_cols = 2 if win_width >= 1200 else 1
+        if new_cols != self._ts_current_cols:
+            self._ts_draw_charts()
+
+    def _ts_draw_charts(self):
+        """Draw time series charts with responsive 1- or 2-column layout."""
+        # Clear previous chart widgets (but keep _ts_segments)
+        for w in self.ts_frame.winfo_children():
+            w.destroy()
+
+        all_segments = self._ts_segments
+        n_segments = len(all_segments)
+
+        # Decide columns based on current window width
+        win_width = self.winfo_width()
+        n_cols = 2 if win_width >= 1200 else 1
+        self._ts_current_cols = n_cols
+        n_rows = math.ceil(n_segments / n_cols)
+
+        fig_w = max(11, self.winfo_width() / 96)  # match window width in inches
+        fig = Figure(figsize=(fig_w, 3.5 * n_rows), dpi=96)
+        fig.subplots_adjust(hspace=0.55, wspace=0.3,
+                            left=0.07, right=0.97, top=0.96, bottom=0.05)
+
+        for idx, (title, seg_data) in enumerate(all_segments):
+            times = [r[2] for r in seg_data]
+            sats = [r[4] * 100 for r in seg_data]  # convert to %
+
+            ax = fig.add_subplot(n_rows, n_cols, idx + 1)
+            ax.plot(times, sats, color="#1f77b4", linewidth=1, label="SAT (%)")
+            ax.set_title(title, fontsize=9)
+            ax.set_xlabel("Time", fontsize=8)
+            ax.set_ylabel("SAT (%)", fontsize=8)
+            ax.set_ylim(0, 80)
+            ax.set_yticks(range(0, 81, 10))
+            ax.tick_params(labelsize=7, axis="x", rotation=30)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d/%Y %H:%M"))
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7, loc="upper right")
+
+        # Scrollable canvas
+        canvas_widget = tk.Canvas(self.ts_frame)
+        scrollbar = ttk.Scrollbar(self.ts_frame, orient=tk.VERTICAL,
+                                  command=canvas_widget.yview)
+        canvas_widget.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(canvas_widget)
+        canvas_widget.create_window((0, 0), window=inner, anchor=tk.NW)
+
+        ttk.Label(inner, text="After 12 Hours Post Operation Charts",
+                  font=("Segoe UI", 14, "bold"), anchor=tk.CENTER).pack(
+                  fill=tk.X, pady=(15, 10))
 
         chart = FigureCanvasTkAgg(fig, master=inner)
         chart.draw()
