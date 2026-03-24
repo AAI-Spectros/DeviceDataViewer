@@ -103,11 +103,11 @@ class DeviceDataViewer(tk.Tk):
     def _build_stats_tab(self):
         # Overall stats table
         cols = ("Metric", "SAT", "HGB")
-        self.stats_tree = ttk.Treeview(self.stats_frame, columns=cols, show="headings", height=10)
+        self.stats_tree = ttk.Treeview(self.stats_frame, columns=cols, show="headings", height=4)
         for c in cols:
             self.stats_tree.heading(c, text=c)
             self.stats_tree.column(c, width=200 if c == "Metric" else 160, anchor=tk.CENTER)
-        self.stats_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.stats_tree.pack(fill=tk.X, padx=10, pady=10)
 
         # Per-device breakdown
         ttk.Label(self.stats_frame, text="Per-Device Breakdown",
@@ -115,9 +115,9 @@ class DeviceDataViewer(tk.Tk):
 
         dev_cols = ("Device", "SAT Mean", "HGB Mean")
         dev_container = ttk.Frame(self.stats_frame)
-        dev_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        dev_container.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        self.dev_stats_tree = ttk.Treeview(dev_container, columns=dev_cols, show="headings", height=8)
+        self.dev_stats_tree = ttk.Treeview(dev_container, columns=dev_cols, show="headings", height=6)
         for c in dev_cols:
             self.dev_stats_tree.heading(c, text=c)
             self.dev_stats_tree.column(c, width=110, anchor=tk.CENTER)
@@ -125,6 +125,30 @@ class DeviceDataViewer(tk.Tk):
         self.dev_stats_tree.configure(yscrollcommand=dev_vsb.set)
         self.dev_stats_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         dev_vsb.pack(side=tk.LEFT, fill=tk.Y)
+
+        # Daily Averages
+        daily_header = ttk.Frame(self.stats_frame)
+        daily_header.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Label(daily_header, text="Daily Averages",
+                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.export_daily_btn = ttk.Button(
+            daily_header, text="Export Daily Averages",
+            command=self._export_daily_averages, state=tk.DISABLED
+        )
+        self.export_daily_btn.pack(side=tk.RIGHT)
+
+        daily_cols = ("Device Serial Number", "Date", "Sat Average")
+        daily_container = ttk.Frame(self.stats_frame)
+        daily_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        self.daily_avg_tree = ttk.Treeview(daily_container, columns=daily_cols, show="headings", height=10)
+        for c in daily_cols:
+            self.daily_avg_tree.heading(c, text=c)
+            self.daily_avg_tree.column(c, width=180, anchor=tk.CENTER)
+        daily_vsb = ttk.Scrollbar(daily_container, orient=tk.VERTICAL, command=self.daily_avg_tree.yview)
+        self.daily_avg_tree.configure(yscrollcommand=daily_vsb.set)
+        self.daily_avg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        daily_vsb.pack(side=tk.LEFT, fill=tk.Y)
 
     # ── Load device list ────────────────────────────────────────────────
     def _load_device_list(self):
@@ -252,6 +276,29 @@ class DeviceDataViewer(tk.Tk):
                 _f(statistics.mean(b["sat"])),
                 _f(statistics.mean(b["hgb"])),
             ))
+
+        # Daily averages
+        for item in self.daily_avg_tree.get_children():
+            self.daily_avg_tree.delete(item)
+
+        daily_buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
+        for r in self._rows:
+            label = r[1]
+            dt = r[2]
+            sat = float(r[4])
+            date_str = dt.strftime("%m/%d/%Y")
+            daily_buckets[(label, date_str)].append(sat)
+
+        for (label, date_str) in sorted(daily_buckets.keys()):
+            vals = daily_buckets[(label, date_str)]
+            avg = statistics.mean(vals)
+            self.daily_avg_tree.insert("", tk.END, values=(
+                label, date_str, _f(avg)
+            ))
+
+        self.export_daily_btn.config(
+            state=tk.NORMAL if daily_buckets else tk.DISABLED
+        )
 
     # ── Tab 2: Distribution histograms ────────────────────────────────
     def _update_histograms(self, rows: list[tuple]):
@@ -675,6 +722,26 @@ class DeviceDataViewer(tk.Tk):
                 writer.writerow([c.upper() for c in COLUMNS])
                 writer.writerows(self._rows)
             self.status_var.set(f"Exported {len(self._rows):,} rows to {path}")
+        except OSError as exc:
+            messagebox.showerror("Export Error", str(exc))
+
+    # ── Export Daily Averages ─────────────────────────────────────────
+    def _export_daily_averages(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Daily Averages to CSV",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Device Serial Number", "Date", "Sat Average"])
+                for child in self.daily_avg_tree.get_children():
+                    writer.writerow(self.daily_avg_tree.item(child, "values"))
+            count = len(self.daily_avg_tree.get_children())
+            self.status_var.set(f"Exported {count} daily average rows to {path}")
         except OSError as exc:
             messagebox.showerror("Export Error", str(exc))
 

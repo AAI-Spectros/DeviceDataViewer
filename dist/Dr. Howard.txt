@@ -1,0 +1,22 @@
+T2-0083
+T2-0084
+T2-0086
+T2-0087
+T2-0186
+T2-0187
+
+If you need a macOS build, you (or someone with a Mac) would need to:
+
+Clone the repo on the Mac
+Install Python 3.13 and create a venv
+pip install -r requirements.txt pyinstaller
+Run: python -m PyInstaller --onefile --windowed --name "DeviceDataViewer" --hidden-import=babel.numbers --hidden-import=mysql.connector.plugins.mysql_native_password --hidden-import=mysql.connector.plugins.caching_sha2_password main.py
+
+DB_CONFIG = {
+    "host": "34.72.78.51",
+    "port": 3306,
+    "user": "aaireader",
+    "password": "3MgGJPqWdYCAxbonyn8O5F9lMCqQ0V9e",
+    "database": "oncall",
+    "use_pure": True,
+}
