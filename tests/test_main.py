@@ -9,8 +9,8 @@ is NOT the real structure; we use two separate files like production):
 
   test_data/DevA.csv  — 1 sensor, 15 rows total
       "New Sensor!" at row 1 (12/01/2025 08:00)
-      Rows 1-8  are within first 12 h  (08:00 → 19:59)
-      Rows 9-15 are after  12 h cutoff (20:00 → 02:00 next day)
+      Rows 1-8  are within first 12 h  (08:00 -> 19:59)
+      Rows 9-15 are after  12 h cutoff (20:00 -> 02:00 next day)
 
   test_data/DevB.csv  — 2 sensors (two "New Sensor!" markers), 12 rows
       Sensor 1: rows 1-6  — all within first 12 h (no after-12h data)
@@ -50,7 +50,7 @@ def _write_csv(path: str, rows: list[list[str]]):
         writer.writerows(rows)
 
 # Device A: 1 sensor, 15 data rows
-# Sensor start: 12/01/2025 08:00  →  cutoff = 12/01/2025 20:00
+# Sensor start: 12/01/2025 08:00  ->  cutoff = 12/01/2025 20:00
 DEVA_ROWS = [
     # --- first 12h (8 rows) ---
     ["12/1/2025 8:00",  "0.45", "0.18", "SNS-A1", "New Sensor!"],
@@ -72,8 +72,8 @@ DEVA_ROWS = [
 ]
 
 # Device B: 2 sensors, 12 data rows
-# Sensor 1 start: 12/03/2025 06:00  →  cutoff = 12/03/2025 18:00
-# Sensor 2 start: 12/05/2025 10:00  →  cutoff = 12/05/2025 22:00
+# Sensor 1 start: 12/03/2025 06:00  ->  cutoff = 12/03/2025 18:00
+# Sensor 2 start: 12/05/2025 10:00  ->  cutoff = 12/05/2025 22:00
 DEVB_ROWS = [
     # --- sensor 1: 6 rows, all within first 12h ---
     ["12/3/2025 6:00",  "0.30", "0.10", "SNS-B1", "New Sensor!"],
@@ -94,7 +94,6 @@ DEVB_ROWS = [
 
 class _FixtureMixin:
     """Set up a temp data/ directory with the two test CSV files."""
-
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.data_dir = os.path.join(self.tmpdir, "data")
@@ -111,7 +110,6 @@ class _FixtureMixin:
 # =====================================================================
 class TestDateParsing(unittest.TestCase):
     """Test _try_parse with all supported DATE_FORMATS."""
-
     def test_parse_24h_format(self):
         dt = _try_parse("12/1/2025 8:00", "%m/%d/%Y %H:%M")
         self.assertEqual(dt, datetime(2025, 12, 1, 8, 0))
@@ -136,7 +134,6 @@ class TestDiscoverCsvFiles(_FixtureMixin, unittest.TestCase):
 
 class TestValidateCsv(_FixtureMixin, unittest.TestCase):
     """Test _validate_csv static method."""
-
     def test_valid_csv_returns_none(self):
         path = os.path.join(self.data_dir, "DevA.csv")
         self.assertIsNone(DeviceDataViewer._validate_csv(path))
@@ -195,7 +192,6 @@ class TestValidateCsv(_FixtureMixin, unittest.TestCase):
 # =====================================================================
 class TestFetchWorker(_FixtureMixin, unittest.TestCase):
     """Test _fetch_worker loads rows correctly using the temp data dir."""
-
     def _load_rows(self) -> list[tuple]:
         """Run _fetch_worker synchronously and capture rows."""
         with patch("main.DATA_DIR", self.data_dir):
@@ -301,7 +297,6 @@ class TestFetchWorker(_FixtureMixin, unittest.TestCase):
 # =====================================================================
 class TestSegmentSplitting(_FixtureMixin, unittest.TestCase):
     """Test the segment-splitting logic used by histograms & time series."""
-
     def _load_rows(self):
         """Same as TestFetchWorker._load_rows."""
         all_rows = []
@@ -485,7 +480,7 @@ class TestSegmentSplitting(_FixtureMixin, unittest.TestCase):
     def test_time_series_segment_count(self):
         """Time series only shows segments with after-12h data:
         DevA-seg1 (7 rows) + DevB-seg2 (3 rows) = 2 segments.
-        DevB-seg1 has 0 after-12h data → excluded."""
+        DevB-seg1 has 0 after-12h data -> excluded."""
         rows = self._load_rows()
         device_segments = self._split_segments(rows)
         ts_segments = []
@@ -521,7 +516,6 @@ class TestSegmentSplitting(_FixtureMixin, unittest.TestCase):
 # =====================================================================
 class TestSummaryStats(_FixtureMixin, unittest.TestCase):
     """Test that summary stat calculations match expected values."""
-
     def _load_rows(self):
         all_rows = []
         for fname in sorted(os.listdir(self.data_dir)):
@@ -596,7 +590,6 @@ class TestSummaryStats(_FixtureMixin, unittest.TestCase):
 # =====================================================================
 class TestSatPercentConversion(_FixtureMixin, unittest.TestCase):
     """Distribution and time series multiply raw SAT by 100."""
-
     def _load_rows(self):
         all_rows = []
         for fname in sorted(os.listdir(self.data_dir)):
@@ -682,7 +675,7 @@ class TestEdgeCases(unittest.TestCase):
                     sensor = row.get("Sensor", "")
                     marker = row.get("Marker", "").strip()
                     all_rows.append((0, "test", dt, dt, sat, hgb, sensor, marker))
-            # Blank row should be skipped → only 2 rows
+            # Blank row should be skipped -> only 2 rows
             self.assertEqual(len(all_rows), 2)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -700,6 +693,121 @@ class TestEdgeCases(unittest.TestCase):
         cutoff = base + timedelta(hours=12)
         after = [r for r in rows_seg if r[2] >= cutoff]
         self.assertEqual(len(after), 0)
+
+
+# =====================================================================
+# 7. Daily averages computation
+# =====================================================================
+class TestDailyAverages(_FixtureMixin, unittest.TestCase):
+    """Test the daily averages logic used in the Summary Statistics tab."""
+
+    def _load_rows(self):
+        all_rows = []
+        for fname in sorted(os.listdir(self.data_dir)):
+            if not fname.endswith(".csv"):
+                continue
+            label = os.path.splitext(fname)[0]
+            csv_path = os.path.join(self.data_dir, fname)
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    raw = row.get("Device Time", "").strip()
+                    if not raw:
+                        continue
+                    dt = None
+                    for fmt in DATE_FORMATS:
+                        dt = _try_parse(raw, fmt)
+                        if dt:
+                            break
+                    if dt is None:
+                        continue
+                    sat = float(row.get("Saturation", 0))
+                    hgb = float(row.get("tGb", 0))
+                    sensor = row.get("Sensor", "")
+                    marker = row.get("Marker", "").strip()
+                    all_rows.append((0, label, dt, dt, sat, hgb, sensor, marker))
+        all_rows.sort(key=lambda r: r[2])
+        return [(i + 1, *r[1:]) for i, r in enumerate(all_rows)]
+
+    @staticmethod
+    def _compute_daily_averages(rows):
+        """Replicate the daily averaging logic from _update_summary_stats."""
+        from collections import defaultdict
+        daily_buckets = defaultdict(list)
+        for r in rows:
+            label = r[1]
+            dt = r[2]
+            sat = float(r[4])
+            date_str = dt.strftime("%m/%d/%Y")
+            daily_buckets[(label, date_str)].append(sat)
+        result = []
+        for (label, date_str) in sorted(daily_buckets.keys()):
+            vals = daily_buckets[(label, date_str)]
+            avg = statistics.mean(vals)
+            result.append((label, date_str, avg))
+        return result
+
+    def test_daily_average_entry_count(self):
+        """Should produce 5 daily entries: DevA×2 days + DevB×3 days."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        self.assertEqual(len(daily), 5)
+
+    def test_daily_average_labels(self):
+        """Check (device, date) pairs are correct."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        keys = [(d[0], d[1]) for d in daily]
+        self.assertEqual(keys, [
+            ("DevA", "12/01/2025"),
+            ("DevA", "12/02/2025"),
+            ("DevB", "12/03/2025"),
+            ("DevB", "12/05/2025"),
+            ("DevB", "12/06/2025"),
+        ])
+
+    def test_deva_day1_average(self):
+        """DevA 12/01: 12 readings -> mean of 0.45..0.53."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        deva_day1 = daily[0]
+        expected = statistics.mean([
+            0.45, 0.44, 0.46, 0.43, 0.40, 0.42, 0.41, 0.39,
+            0.50, 0.51, 0.52, 0.53,
+        ])
+        self.assertAlmostEqual(deva_day1[2], expected, places=6)
+
+    def test_deva_day2_average(self):
+        """DevA 12/02: 3 readings -> mean of 0.54, 0.55, 0.56."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        deva_day2 = daily[1]
+        expected = statistics.mean([0.54, 0.55, 0.56])
+        self.assertAlmostEqual(deva_day2[2], expected, places=6)
+
+    def test_devb_day1_average(self):
+        """DevB 12/03: 6 readings -> mean of 0.30..0.35."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        devb_day1 = daily[2]
+        expected = statistics.mean([0.30, 0.31, 0.32, 0.33, 0.34, 0.35])
+        self.assertAlmostEqual(devb_day1[2], expected, places=6)
+
+    def test_devb_day2_average(self):
+        """DevB 12/05: 5 readings -> mean of 0.60, 0.61, 0.62, 0.70, 0.71."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        devb_day2 = daily[3]
+        expected = statistics.mean([0.60, 0.61, 0.62, 0.70, 0.71])
+        self.assertAlmostEqual(devb_day2[2], expected, places=6)
+
+    def test_devb_day3_average(self):
+        """DevB 12/06: 1 reading -> 0.72."""
+        rows = self._load_rows()
+        daily = self._compute_daily_averages(rows)
+        devb_day3 = daily[4]
+        self.assertAlmostEqual(devb_day3[2], 0.72, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
